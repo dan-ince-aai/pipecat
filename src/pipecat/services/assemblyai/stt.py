@@ -53,6 +53,11 @@ class AssemblyAISTTService(STTService):
             "encoding": encoding,
             "language": language,
         }
+        
+        # Track whether we've received any transcription yet
+        self._has_received_first_transcription = False
+        # Track when speech was detected to properly measure ttfb
+        self._speech_detected = False
 
     def can_generate_metrics(self) -> bool:
         """Indicate that this service supports metrics generation."""
@@ -89,10 +94,9 @@ class AssemblyAISTTService(STTService):
         :yield: None (transcription frames are pushed via self.push_frame in callbacks)
         """
         if self._transcriber:
-            # Only start processing metrics here - ttfb metrics are started when speech is detected
-            await self.start_processing_metrics()
+            # We don't start processing metrics here like before
+            # Only stream the audio to AssemblyAI
             self._transcriber.stream(audio)
-            # Note: stop_processing_metrics will be called in on_data when final transcript is received
         yield None
 
     async def _connect(self):
@@ -123,8 +127,11 @@ class AssemblyAISTTService(STTService):
 
             # Create a coroutine for handling this transcript with metrics
             async def handle_transcript():
-                # Stop TTFB metrics when we first get transcript content
-                await self.stop_ttfb_metrics()
+                # If this is the first transcript received after speech was detected,
+                # stop the TTFB metrics to measure the time to first byte
+                if self._speech_detected and not self._has_received_first_transcription:
+                    await self.stop_ttfb_metrics()
+                    self._has_received_first_transcription = True
                 
                 if isinstance(transcript, aai.RealtimeFinalTranscript):
                     # For final transcripts, create a TranscriptionFrame and stop processing metrics
@@ -132,7 +139,12 @@ class AssemblyAISTTService(STTService):
                         transcript.text, "", timestamp, self._settings["language"]
                     )
                     await self.push_frame(frame)
-                    await self.stop_processing_metrics()
+                    
+                    # Stop processing metrics when we get a final transcription
+                    if self._speech_detected:
+                        await self.stop_processing_metrics()
+                        self._speech_detected = False
+                        self._has_received_first_transcription = False
                 else:
                     # For interim transcripts, just create an InterimTranscriptionFrame
                     frame = InterimTranscriptionFrame(
@@ -185,6 +197,8 @@ class AssemblyAISTTService(STTService):
             self._transcriber.close()
             self._transcriber = None
             await self.stop_all_metrics()
+            self._speech_detected = False
+            self._has_received_first_transcription = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames from the pipeline.
@@ -196,7 +210,13 @@ class AssemblyAISTTService(STTService):
         
         if isinstance(frame, UserStartedSpeakingFrame):
             # Start metrics when VAD has detected speech
+            self._speech_detected = True
             await self.start_metrics()
         elif isinstance(frame, UserStoppedSpeakingFrame):
-            # When user stops speaking, just log it - metrics will be stopped when final transcript is received
+            # When user stops speaking but we've not received any transcription yet,
+            # make sure we stop metrics properly to avoid metrics continuing indefinitely
+            if self._speech_detected and not self._has_received_first_transcription:
+                await self.stop_all_metrics()
+                self._speech_detected = False
+                self._has_received_first_transcription = False
             logger.trace(f"User stopped speaking: {frame.name=}, {direction=}")
