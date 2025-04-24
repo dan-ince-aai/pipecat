@@ -17,7 +17,10 @@ from pipecat.frames.frames import (
     InterimTranscriptionFrame,
     StartFrame,
     TranscriptionFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
 )
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
@@ -51,6 +54,10 @@ class AssemblyAISTTService(STTService):
             "language": language,
         }
 
+    def can_generate_metrics(self) -> bool:
+        """Indicate that this service supports metrics generation."""
+        return True
+
     async def set_language(self, language: Language):
         logger.info(f"Switching STT language to: [{language}]")
         self._settings["language"] = language
@@ -67,6 +74,11 @@ class AssemblyAISTTService(STTService):
         await super().cancel(frame)
         await self._disconnect()
 
+    async def start_metrics(self):
+        """Start all metrics tracking."""
+        await self.start_ttfb_metrics()
+        await self.start_processing_metrics()
+
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
         """Process an audio chunk for STT transcription.
 
@@ -77,9 +89,10 @@ class AssemblyAISTTService(STTService):
         :yield: None (transcription frames are pushed via self.push_frame in callbacks)
         """
         if self._transcriber:
+            # Only start processing metrics here - ttfb metrics are started when speech is detected
             await self.start_processing_metrics()
             self._transcriber.stream(audio)
-            await self.stop_processing_metrics()
+            # Note: stop_processing_metrics will be called in on_data when final transcript is received
         yield None
 
     async def _connect(self):
@@ -108,18 +121,28 @@ class AssemblyAISTTService(STTService):
 
             timestamp = time_now_iso8601()
 
-            if isinstance(transcript, aai.RealtimeFinalTranscript):
-                frame = TranscriptionFrame(
-                    transcript.text, "", timestamp, self._settings["language"]
-                )
-            else:
-                frame = InterimTranscriptionFrame(
-                    transcript.text, "", timestamp, self._settings["language"]
-                )
+            # Create a coroutine for handling this transcript with metrics
+            async def handle_transcript():
+                # Stop TTFB metrics when we first get transcript content
+                await self.stop_ttfb_metrics()
+                
+                if isinstance(transcript, aai.RealtimeFinalTranscript):
+                    # For final transcripts, create a TranscriptionFrame and stop processing metrics
+                    frame = TranscriptionFrame(
+                        transcript.text, "", timestamp, self._settings["language"]
+                    )
+                    await self.push_frame(frame)
+                    await self.stop_processing_metrics()
+                else:
+                    # For interim transcripts, just create an InterimTranscriptionFrame
+                    frame = InterimTranscriptionFrame(
+                        transcript.text, "", timestamp, self._settings["language"]
+                    )
+                    await self.push_frame(frame)
 
             # Schedule the coroutine to run in the main event loop
             # This is necessary because this callback runs in a different thread
-            asyncio.run_coroutine_threadsafe(self.push_frame(frame), self.get_event_loop())
+            asyncio.run_coroutine_threadsafe(handle_transcript(), self.get_event_loop())
 
         def on_error(error: aai.RealtimeError):
             """Callback for handling errors from AssemblyAI.
@@ -128,14 +151,23 @@ class AssemblyAISTTService(STTService):
             handling in the main event loop.
             """
             logger.error(f"{self}: An error occurred: {error}")
+
+            async def handle_error():
+                await self.stop_all_metrics()
+                await self.push_frame(ErrorFrame(str(error)))
+                
             # Schedule the coroutine to run in the main event loop
-            asyncio.run_coroutine_threadsafe(
-                self.push_frame(ErrorFrame(str(error))), self.get_event_loop()
-            )
+            asyncio.run_coroutine_threadsafe(handle_error(), self.get_event_loop())
 
         def on_close():
             """Callback for when the connection to AssemblyAI is closed."""
             logger.info(f"{self}: Disconnected from AssemblyAI")
+
+            async def handle_close():
+                await self.stop_all_metrics()
+                
+            # Schedule the coroutine to run in the main event loop
+            asyncio.run_coroutine_threadsafe(handle_close(), self.get_event_loop())
 
         self._transcriber = aai.RealtimeTranscriber(
             sample_rate=self.sample_rate,
@@ -152,3 +184,19 @@ class AssemblyAISTTService(STTService):
         if self._transcriber:
             self._transcriber.close()
             self._transcriber = None
+            await self.stop_all_metrics()
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Process frames from the pipeline.
+        
+        This method enables the service to react to user started/stopped speaking frames
+        to start and manage metrics appropriately.
+        """
+        await super().process_frame(frame, direction)
+        
+        if isinstance(frame, UserStartedSpeakingFrame):
+            # Start metrics when VAD has detected speech
+            await self.start_metrics()
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            # When user stops speaking, just log it - metrics will be stopped when final transcript is received
+            logger.trace(f"User stopped speaking: {frame.name=}, {direction=}")
