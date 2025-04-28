@@ -391,15 +391,15 @@ class AssemblyAISTTService(STTService):
             await self.custom_start_metrics()
             
             # We still call the standard metrics methods for compatibility
-            await self.start_ttfb_metrics()
-            await self.start_processing_metrics()
+            #await self.start_ttfb_metrics()
+            #await self.start_processing_metrics()
         elif isinstance(frame, UserStoppedSpeakingFrame):
             # If user stopped speaking but we haven't emitted metrics,
             # we should stop metrics tracking to prevent hanging metrics
             logger.debug(f"{self.name}: Speech stopped")
             
             # We still call the standard metrics methods for compatibility
-            await self.stop_all_metrics()
+            #await self.stop_all_metrics()
             
             if self._active_speech and self._metrics_started and not self._ttfb_reported:
                 # No transcription was received, so reset metrics
