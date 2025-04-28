@@ -235,7 +235,6 @@ class AssemblyAISTTService(STTService):
         connection_params = {
             "sample_rate": self._settings["sample_rate"],
             "encoding": self._settings["encoding"],
-            "formatted_finals": self._settings["formatted_finals"],
         }
         api_endpoint = f"{self._api_endpoint_base_url}?{urlencode(connection_params)}"
         
