@@ -5,10 +5,14 @@
 #
 
 import asyncio
+import json
 import time
-from typing import AsyncGenerator, Optional, Dict
+import threading
+from typing import AsyncGenerator, Optional, Dict, Any
+from urllib.parse import urlencode
 
 from loguru import logger
+import websocket
 
 from pipecat.frames.frames import (
     CancelFrame,
@@ -28,14 +32,6 @@ from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 
-try:
-    import assemblyai as aai
-    from assemblyai import AudioEncoding
-except ModuleNotFoundError as e:
-    logger.error(f"Exception: {e}")
-    logger.error("In order to use AssemblyAI, you need to `pip install pipecat-ai[assemblyai]`.")
-    raise Exception(f"Missing module: {e}")
-
 
 class AssemblyAISTTService(STTService):
     def __init__(
@@ -43,18 +39,31 @@ class AssemblyAISTTService(STTService):
         *,
         api_key: str,
         sample_rate: Optional[int] = None,
-        encoding: AudioEncoding = AudioEncoding("pcm_s16le"),
+        encoding: str = "pcm_s16le",
         language=Language.EN,  # Only English is supported for Realtime
+        use_direct_websocket: bool = True,  # Use direct websocket instead of SDK
+        api_endpoint_base_url: str = "wss://streaming.assemblyai.com/v3/ws",
+        formatted_finals: bool = True,
         **kwargs,
     ):
         super().__init__(sample_rate=sample_rate, **kwargs)
 
-        aai.settings.api_key = api_key
-        self._transcriber: Optional[aai.RealtimeTranscriber] = None
-
+        self._api_key = api_key
+        self._use_direct_websocket = use_direct_websocket
+        self._api_endpoint_base_url = api_endpoint_base_url
+        
+        # WebSocket related variables
+        self._ws_app = None
+        self._ws_thread = None
+        self._stop_event = threading.Event()
+        self._audio_buffer = bytearray()
+        self._buffer_lock = threading.Lock()
+        
         self._settings = {
             "encoding": encoding,
             "language": language,
+            "sample_rate": sample_rate or 16000,  # Default to 16kHz if not specified
+            "formatted_finals": formatted_finals,
         }
         
         # Custom metrics tracking
@@ -64,6 +73,10 @@ class AssemblyAISTTService(STTService):
         self._ttfb_reported = False
         self._active_speech = False
         self._lock = asyncio.Lock()
+        
+        # Queue for handling transcription results from websocket thread
+        self._result_queue = asyncio.Queue()
+        self._connected = False
 
     def can_generate_metrics(self) -> bool:
         """Indicate that this service supports metrics generation."""
@@ -135,6 +148,58 @@ class AssemblyAISTTService(STTService):
             self._metrics_started = False
             self._processing_start_time = 0
             self._ttfb_start_time = 0
+            
+    async def _process_result_queue(self):
+        """Process transcription results from the websocket thread."""
+        while True:
+            try:
+                result = await self._result_queue.get()
+                if result is None:  # None is our signal to stop
+                    break
+                    
+                msg_type = result.get('type')
+                timestamp = time_now_iso8601()
+                
+                if msg_type == 'Partial':
+                    text = result.get('text', '')
+                    if text:
+                        # For interim transcripts, create an InterimTranscriptionFrame
+                        frame = InterimTranscriptionFrame(
+                            text, "", timestamp, self._settings["language"]
+                        )
+                        await self.push_frame(frame)
+                        
+                        # If we have active metrics and haven't reported TTFB yet, do so now
+                        if self._active_speech and self._metrics_started and not self._ttfb_reported:
+                            await self.emit_ttfb_metrics()
+                            
+                elif msg_type == 'Final':
+                    text = result.get('text', '')
+                    if text:
+                        # For final transcripts, create a TranscriptionFrame and emit processing metrics
+                        frame = TranscriptionFrame(
+                            text, "", timestamp, self._settings["language"]
+                        )
+                        await self.push_frame(frame)
+                        
+                        # Emit processing metrics for final transcript
+                        if self._active_speech and self._metrics_started:
+                            await self.emit_processing_metrics()
+                            self._active_speech = False
+                            
+                elif msg_type == 'Error':
+                    error_message = result.get('error', 'Unknown error from AssemblyAI')
+                    logger.error(f"{self}: An error occurred: {error_message}")
+                    await self.custom_stop_all_metrics()
+                    await self.push_frame(ErrorFrame(error_message))
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"{self}: Error processing result: {e}")
+                await self.push_frame(ErrorFrame(str(e)))
+            finally:
+                self._result_queue.task_done()
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
         """Process an audio chunk for STT transcription.
@@ -145,106 +210,172 @@ class AssemblyAISTTService(STTService):
         :param audio: Audio data as bytes
         :yield: None (transcription frames are pushed via self.push_frame in callbacks)
         """
-        if self._transcriber:
-            # Don't do any metrics here - metrics are handled by custom tracking
-            self._transcriber.stream(audio)
+        if self._connected:
+            # Add audio to buffer - will be sent by websocket thread
+            with self._buffer_lock:
+                self._audio_buffer.extend(audio)
         yield None
 
     async def _connect(self):
         """Establish a connection to the AssemblyAI real-time transcription service.
 
         This method sets up the necessary callback functions and initializes the
-        AssemblyAI transcriber.
+        websocket connection to AssemblyAI.
         """
-        if self._transcriber:
+        if self._connected:
             return
-
-        def on_open(session_opened: aai.RealtimeSessionOpened):
+            
+        # Start the result queue processor
+        self._result_processor_task = asyncio.create_task(self._process_result_queue())
+        
+        # Reset the stop event
+        self._stop_event.clear()
+        
+        # Build the connection URL with parameters
+        connection_params = {
+            "sample_rate": self._settings["sample_rate"],
+            "encoding": self._settings["encoding"],
+            "formatted_finals": self._settings["formatted_finals"],
+        }
+        api_endpoint = f"{self._api_endpoint_base_url}?{urlencode(connection_params)}"
+        
+        def on_open(ws):
             """Callback for when the connection to AssemblyAI is opened."""
-            logger.info(f"{self}: Connected to AssemblyAI")
+            logger.info(f"{self}: Connected to AssemblyAI WebSocket")
+            self._connected = True
+            
+            # Start sending audio data in a separate thread
+            def stream_audio():
+                logger.debug("Starting audio streaming thread...")
+                while not self._stop_event.is_set():
+                    try:
+                        # Get audio from buffer
+                        with self._buffer_lock:
+                            if len(self._audio_buffer) > 0:
+                                audio_data = bytes(self._audio_buffer)
+                                self._audio_buffer.clear()
+                                # Send audio data as binary message
+                                ws.send(audio_data, websocket.ABNF.OPCODE_BINARY)
+                        # Sleep a tiny bit to avoid spinning
+                        time.sleep(0.01)
+                    except Exception as e:
+                        logger.error(f'Error streaming audio: {e}')
+                        # If send fails, likely means connection is closed
+                        break
+                logger.debug("Audio streaming thread stopped.")
 
-        def on_data(transcript: aai.RealtimeTranscript):
-            """Callback for handling incoming transcription data.
+            self._audio_thread = threading.Thread(target=stream_audio)
+            self._audio_thread.daemon = True
+            self._audio_thread.start()
 
-            This function runs in a separate thread from the main asyncio event loop.
-            It creates appropriate transcription frames and schedules them to be
-            pushed to the next stage of the pipeline in the main event loop.
-            """
-            if not transcript.text:
-                return
+        def on_message(ws, message):
+            """Callback for handling incoming transcription data."""
+            try:
+                data = json.loads(message)
+                # Put the result in the queue for processing in the main event loop
+                asyncio.run_coroutine_threadsafe(
+                    self._result_queue.put(data), 
+                    self.get_event_loop()
+                )
+            except json.JSONDecodeError:
+                logger.error(f"Received non-JSON message: {message}")
+            except Exception as e:
+                logger.error(f'Error handling message: {e}')
 
-            timestamp = time_now_iso8601()
+        def on_error(ws, error):
+            """Callback for handling errors from AssemblyAI."""
+            logger.error(f"{self}: WebSocket Error: {error}")
+            
+            # Put error in queue
+            error_data = {"type": "Error", "error": str(error)}
+            asyncio.run_coroutine_threadsafe(
+                self._result_queue.put(error_data),
+                self.get_event_loop()
+            )
+            
+            # Signal stop
+            self._stop_event.set()
 
-            # Create a coroutine for handling this transcript with metrics
-            async def handle_transcript():
-                # If we have active metrics and haven't reported TTFB yet, do so now
-                if self._active_speech and self._metrics_started and not self._ttfb_reported:
-                    await self.emit_ttfb_metrics()
-                
-                if isinstance(transcript, aai.RealtimeFinalTranscript):
-                    # For final transcripts, create a TranscriptionFrame and emit processing metrics
-                    frame = TranscriptionFrame(
-                        transcript.text, "", timestamp, self._settings["language"]
-                    )
-                    await self.push_frame(frame)
-                    
-                    # Emit processing metrics for final transcript
-                    if self._active_speech and self._metrics_started:
-                        await self.emit_processing_metrics()
-                        self._active_speech = False
-                else:
-                    # For interim transcripts, just create an InterimTranscriptionFrame
-                    frame = InterimTranscriptionFrame(
-                        transcript.text, "", timestamp, self._settings["language"]
-                    )
-                    await self.push_frame(frame)
-
-            # Schedule the coroutine to run in the main event loop
-            # This is necessary because this callback runs in a different thread
-            asyncio.run_coroutine_threadsafe(handle_transcript(), self.get_event_loop())
-
-        def on_error(error: aai.RealtimeError):
-            """Callback for handling errors from AssemblyAI.
-
-            Like on_data, this runs in a separate thread and schedules error
-            handling in the main event loop.
-            """
-            logger.error(f"{self}: An error occurred: {error}")
-
-            async def handle_error():
-                await self.custom_stop_all_metrics()
-                await self.push_frame(ErrorFrame(str(error)))
-                
-            # Schedule the coroutine to run in the main event loop
-            asyncio.run_coroutine_threadsafe(handle_error(), self.get_event_loop())
-
-        def on_close():
+        def on_close(ws, close_status_code, close_msg):
             """Callback for when the connection to AssemblyAI is closed."""
-            logger.info(f"{self}: Disconnected from AssemblyAI")
+            logger.info(f"{self}: WebSocket Disconnected: Status={close_status_code}, Msg={close_msg}")
+            self._connected = False
+            
+            # Signal audio thread to stop
+            self._stop_event.set()
+            
+            # Put close event in queue
+            close_data = {"type": "Close"}
+            asyncio.run_coroutine_threadsafe(
+                self._result_queue.put(close_data),
+                self.get_event_loop()
+            )
 
-            async def handle_close():
-                await self.custom_stop_all_metrics()
-                
-            # Schedule the coroutine to run in the main event loop
-            asyncio.run_coroutine_threadsafe(handle_close(), self.get_event_loop())
-
-        self._transcriber = aai.RealtimeTranscriber(
-            sample_rate=self.sample_rate,
-            encoding=self._settings["encoding"],
-            on_data=on_data,
-            on_error=on_error,
+        # Create WebSocketApp
+        self._ws_app = websocket.WebSocketApp(
+            api_endpoint,
+            header={'Authorization': self._api_key},
             on_open=on_open,
-            on_close=on_close,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close
         )
-        self._transcriber.connect()
+        
+        # Run WebSocketApp in a separate thread
+        self._ws_thread = threading.Thread(target=self._ws_app.run_forever)
+        self._ws_thread.daemon = True
+        self._ws_thread.start()
+        
+        # Wait a bit for the connection to establish
+        for _ in range(10):  # Wait up to 1 second
+            if self._connected:
+                break
+            await asyncio.sleep(0.1)
 
     async def _disconnect(self):
         """Disconnect from the AssemblyAI service and clean up resources."""
-        if self._transcriber:
-            self._transcriber.close()
-            self._transcriber = None
-            await self.custom_stop_all_metrics()
-            self._active_speech = False
+        if not self._connected:
+            return
+            
+        logger.info(f"{self}: Disconnecting from AssemblyAI WebSocket")
+        
+        # Signal audio thread to stop
+        self._stop_event.set()
+        
+        # Send termination message to the server
+        if self._ws_app and self._ws_app.sock and self._ws_app.sock.connected:
+            try:
+                terminate_message = {"type": "Terminate"}
+                logger.debug(f"Sending termination message: {json.dumps(terminate_message)}")
+                self._ws_app.send(json.dumps(terminate_message))
+                # Give a moment for messages to process before forceful close
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.error(f"Error sending termination message: {e}")
+                
+        # Close the WebSocket connection
+        if self._ws_app:
+            self._ws_app.close()
+            
+        # Wait for WebSocket thread to finish
+        if self._ws_thread and self._ws_thread.is_alive():
+            self._ws_thread.join(timeout=2.0)
+            
+        # Signal the result processor to stop
+        await self._result_queue.put(None)
+        if hasattr(self, '_result_processor_task'):
+            await self._result_processor_task
+            
+        # Clean up resources
+        self._connected = False
+        self._ws_app = None
+        self._ws_thread = None
+        await self.custom_stop_all_metrics()
+        self._active_speech = False
+        
+        # Clear audio buffer
+        with self._buffer_lock:
+            self._audio_buffer.clear()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames from the pipeline.
