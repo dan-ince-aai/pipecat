@@ -392,3 +392,4 @@ class AssemblyAISTTService(STTService):
             if self._active_speech:
                 # Start processing metrics from when speech stopped
                 await self.start_processing_custom_metrics()
+                self._active_speech = False
