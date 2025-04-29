@@ -175,9 +175,8 @@ class AssemblyAISTTService(STTService):
                         await self.push_frame(frame)
                         
                         # Emit processing metrics for final transcript
-                        if self._active_speech:
-                            await self.emit_processing_custom_metrics()
-                            self._active_speech = False
+                        await self.emit_processing_custom_metrics()
+                        self._active_speech = False
                             
                 elif msg_type == 'Error':
                     error_message = result.get('error', 'Unknown error from AssemblyAI')

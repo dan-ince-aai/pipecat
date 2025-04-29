@@ -252,9 +252,9 @@ class DeepgramSTTService(STTService):
                 await self.push_frame(
                     TranscriptionFrame(transcript, "", time_now_iso8601(), language)
                 )
-                if self._active_speech:
-                    await self.emit_processing_custom_metrics()
-                    self._active_speech = False
+                # Always emit processing metrics for final transcripts if we have a start time
+                await self.emit_processing_custom_metrics()
+                self._active_speech = False
             else:
                 await self.push_frame(
                     InterimTranscriptionFrame(transcript, "", time_now_iso8601(), language)
