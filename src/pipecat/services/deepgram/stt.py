@@ -246,13 +246,12 @@ class DeepgramSTTService(STTService):
             language = Language(language)
         if len(transcript) > 0:
             if speech_final:
+                await self.emit_processing_custom_metrics
+            if is_final:
                 logger.debug(f"{self.name}: Final transcript received: {transcript}")
                 await self.push_frame(
                     TranscriptionFrame(transcript, "", time_now_iso8601(), language)
                 )
-                # Always emit processing metrics for final transcripts if we have a start time
-                await self.emit_processing_custom_metrics()
-                self._active_speech = False
             else:
                 # For interim transcripts, emit TTFB metrics if not already reported
                 if not self._ttfb_reported:
@@ -268,7 +267,6 @@ class DeepgramSTTService(STTService):
         if isinstance(frame, UserStartedSpeakingFrame) and not self.vad_enabled:
             # Start TTFB metrics if Deepgram VAD is disabled & pipeline VAD has detected speech
             logger.debug(f"{self.name}: Speech detected by pipeline VAD, starting TTFB metrics")
-            self._active_speech = True
             await self.start_ttfb_custom_metrics()
             await self.start_processing_custom_metrics()
         elif isinstance(frame, UserStoppedSpeakingFrame):
