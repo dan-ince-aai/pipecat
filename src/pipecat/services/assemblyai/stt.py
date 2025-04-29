@@ -64,6 +64,7 @@ class AssemblyAISTTService(STTService):
             "language": language,
             "sample_rate": sample_rate or 16000,  # Default to 16kHz if not specified
             "formatted_finals": formatted_finals,
+            "endpoint_silence_threshold_ms": endpoint_silence_threshold_ms,
         }
         
         # Custom metrics tracking
