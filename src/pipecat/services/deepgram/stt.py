@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
-
+import time
 from typing import AsyncGenerator, Dict, Optional
 
 from loguru import logger
@@ -13,8 +13,11 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     InterimTranscriptionFrame,
+    MetricsFrame,
     StartFrame,
     TranscriptionFrame,
+    TTFBMetricsData,
+    ProcessingMetricsData,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
@@ -98,6 +101,12 @@ class DeepgramSTTService(STTService):
             ),
         )
 
+        # Custom metrics tracking
+        self._ttfb_start_time = 0
+        self._processing_start_time = 0
+        self._ttfb_reported = False
+        self._active_speech = False
+
         if self.vad_enabled:
             self._register_event_handler("on_speech_started")
             self._register_event_handler("on_utterance_end")
@@ -106,8 +115,45 @@ class DeepgramSTTService(STTService):
     def vad_enabled(self):
         return self._settings["vad_events"]
 
-    def can_generate_metrics(self) -> bool:
-        return True
+    async def start_ttfb_custom_metrics(self):
+        """Start measuring time to first byte metrics when speech is detected."""
+        self._ttfb_start_time = time.time()
+        self._ttfb_reported = False
+        logger.debug(f"{self.name}: Started TTFB metrics tracking at {self._ttfb_start_time}")
+
+    async def start_processing_custom_metrics(self):
+        """Start measuring processing time metrics when speech stops."""
+        self._processing_start_time = time.time()
+        logger.debug(f"{self.name}: Started processing metrics tracking at {self._processing_start_time}")
+
+    async def emit_ttfb_custom_metrics(self):
+        """Emit TTFB metrics when first partial transcript is received."""
+        if self._ttfb_start_time == 0 or self._ttfb_reported:
+            return
+        
+        elapsed = time.time() - self._ttfb_start_time
+        logger.debug(f"{self.name}: TTFB metrics - {elapsed:.3f}s")
+        
+        # Create and emit metrics frame
+        ttfb = TTFBMetricsData(processor=self.name, value=elapsed)
+        await self.push_frame(MetricsFrame(data=[ttfb]))
+        
+        self._ttfb_reported = True
+
+    async def emit_processing_custom_metrics(self):
+        """Emit processing metrics when final transcript is received."""
+        if self._processing_start_time == 0:
+            return
+        
+        elapsed = time.time() - self._processing_start_time
+        logger.debug(f"{self.name}: Processing metrics - {elapsed:.3f}s")
+        
+        # Create and emit metrics frame
+        processing = ProcessingMetricsData(processor=self.name, value=elapsed)
+        await self.push_frame(MetricsFrame(data=[processing]))
+        
+        # Reset processing metrics state after final processing
+        self._processing_start_time = 0
 
     async def set_model(self, model: str):
         await super().set_model(model)
@@ -167,10 +213,6 @@ class DeepgramSTTService(STTService):
             logger.debug("Disconnecting from Deepgram")
             await self._connection.finish()
 
-    async def start_metrics(self):
-        await self.start_ttfb_metrics()
-        await self.start_processing_metrics()
-
     async def _on_error(self, *args, **kwargs):
         error: ErrorResponse = kwargs["error"]
         logger.warning(f"{self} connection error, will retry: {error}")
@@ -181,10 +223,15 @@ class DeepgramSTTService(STTService):
         await self._connect()
 
     async def _on_speech_started(self, *args, **kwargs):
-        await self.start_metrics()
+        logger.debug(f"{self.name}: Speech detected by Deepgram VAD, starting TTFB metrics")
+        self._active_speech = True
+        await self.start_ttfb_custom_metrics()
         await self._call_event_handler("on_speech_started", *args, **kwargs)
 
     async def _on_utterance_end(self, *args, **kwargs):
+        logger.debug(f"{self.name}: Speech stopped (utterance end), starting processing metrics")
+        if self._active_speech:
+            await self.start_processing_custom_metrics()
         await self._call_event_handler("on_utterance_end", *args, **kwargs)
 
     async def _on_message(self, *args, **kwargs):
@@ -198,12 +245,16 @@ class DeepgramSTTService(STTService):
             language = result.channel.alternatives[0].languages[0]
             language = Language(language)
         if len(transcript) > 0:
-            await self.stop_ttfb_metrics()
+            if not self._ttfb_reported and self._active_speech:
+                await self.emit_ttfb_custom_metrics()
+                
             if is_final:
                 await self.push_frame(
                     TranscriptionFrame(transcript, "", time_now_iso8601(), language)
                 )
-                await self.stop_processing_metrics()
+                if self._active_speech:
+                    await self.emit_processing_custom_metrics()
+                    self._active_speech = False
             else:
                 await self.push_frame(
                     InterimTranscriptionFrame(transcript, "", time_now_iso8601(), language)
@@ -213,9 +264,16 @@ class DeepgramSTTService(STTService):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, UserStartedSpeakingFrame) and not self.vad_enabled:
-            # Start metrics if Deepgram VAD is disabled & pipeline VAD has detected speech
-            await self.start_metrics()
+            # Start TTFB metrics if Deepgram VAD is disabled & pipeline VAD has detected speech
+            logger.debug(f"{self.name}: Speech detected by pipeline VAD, starting TTFB metrics")
+            self._active_speech = True
+            await self.start_ttfb_custom_metrics()
         elif isinstance(frame, UserStoppedSpeakingFrame):
+            # Start processing metrics when speech stops
+            logger.debug(f"{self.name}: Speech stopped (pipeline VAD), starting processing metrics")
+            if self._active_speech:
+                await self.start_processing_custom_metrics()
+                
             # https://developers.deepgram.com/docs/finalize
             await self._connection.finalize()
             logger.trace(f"Triggered finalize event on: {frame.name=}, {direction=}")
