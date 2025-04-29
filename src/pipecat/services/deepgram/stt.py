@@ -245,10 +245,8 @@ class DeepgramSTTService(STTService):
             language = result.channel.alternatives[0].languages[0]
             language = Language(language)
         if len(transcript) > 0:
-            if not self._ttfb_reported and self._active_speech:
-                await self.emit_ttfb_custom_metrics()
-                
             if is_final:
+                logger.debug(f"{self.name}: Final transcript received: {transcript}")
                 await self.push_frame(
                     TranscriptionFrame(transcript, "", time_now_iso8601(), language)
                 )
@@ -256,6 +254,10 @@ class DeepgramSTTService(STTService):
                 await self.emit_processing_custom_metrics()
                 self._active_speech = False
             else:
+                # For interim transcripts, emit TTFB metrics if not already reported
+                if not self._ttfb_reported and self._active_speech:
+                    await self.emit_ttfb_custom_metrics()
+                
                 await self.push_frame(
                     InterimTranscriptionFrame(transcript, "", time_now_iso8601(), language)
                 )
