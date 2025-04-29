@@ -275,6 +275,7 @@ class DeepgramSTTService(STTService):
             logger.debug(f"{self.name}: Speech stopped (pipeline VAD), starting processing metrics")
             if self._active_speech:
                 await self.start_processing_custom_metrics()
+                self._active_speech = False
                 
             # https://developers.deepgram.com/docs/finalize
             await self._connection.finalize()
