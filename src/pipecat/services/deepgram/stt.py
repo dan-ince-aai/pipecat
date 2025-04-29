@@ -238,13 +238,14 @@ class DeepgramSTTService(STTService):
         if len(result.channel.alternatives) == 0:
             return
         is_final = result.is_final
+        speech_final = result.speech_final
         transcript = result.channel.alternatives[0].transcript
         language = None
         if result.channel.alternatives[0].languages:
             language = result.channel.alternatives[0].languages[0]
             language = Language(language)
         if len(transcript) > 0:
-            if is_final:
+            if speech_final:
                 logger.debug(f"{self.name}: Final transcript received: {transcript}")
                 await self.push_frame(
                     TranscriptionFrame(transcript, "", time_now_iso8601(), language)
