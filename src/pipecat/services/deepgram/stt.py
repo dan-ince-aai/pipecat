@@ -257,10 +257,6 @@ class DeepgramSTTService(STTService):
                 if not self._ttfb_reported:
                     await self.emit_ttfb_custom_metrics()
                 
-                # Start/restart processing metrics from this partial
-                # This way we measure processing time from the last partial to the final
-                await self.start_processing_custom_metrics()
-                
                 await self.push_frame(
                     InterimTranscriptionFrame(transcript, "", time_now_iso8601(), language)
                 )
@@ -273,6 +269,7 @@ class DeepgramSTTService(STTService):
             logger.debug(f"{self.name}: Speech detected by pipeline VAD, starting TTFB metrics")
             self._active_speech = True
             await self.start_ttfb_custom_metrics()
+            await self.start_processing_custom_metrics()
         elif isinstance(frame, UserStoppedSpeakingFrame):
             # No need to start processing metrics here anymore since we're measuring from last partial
             logger.debug(f"{self.name}: Speech stopped (pipeline VAD)")

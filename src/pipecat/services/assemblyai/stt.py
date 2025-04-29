@@ -164,10 +164,6 @@ class AssemblyAISTTService(STTService):
                         # For interim transcripts, emit TTFB metrics if not already reported
                         if not self._ttfb_reported:
                             await self.emit_ttfb_custom_metrics()
-                        
-                        # Start/restart processing metrics from this partial
-                        # This way we measure processing time from the last partial to the final
-                        await self.start_processing_custom_metrics()
                             
                 elif msg_type == 'Final':
                     text = result.get('text', '')
@@ -382,6 +378,7 @@ class AssemblyAISTTService(STTService):
             logger.debug(f"{self.name}: Speech detected, starting TTFB metrics")
             self._active_speech = True
             await self.start_ttfb_custom_metrics()
+            await self.start_processing_custom_metrics()
             
             # We don't need the standard metrics calls anymore
             #await self.start_ttfb_metrics()
