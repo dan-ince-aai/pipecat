@@ -67,7 +67,6 @@ class AssemblyAISTTService(STTService):
         }
         
         # Custom metrics tracking
-        self._metrics_started = False
         self._ttfb_start_time = 0
         self._processing_start_time = 0
         self._ttfb_reported = False
@@ -98,28 +97,23 @@ class AssemblyAISTTService(STTService):
         await super().cancel(frame)
         await self._disconnect()
 
-    async def custom_start_metrics(self):
-        """Custom implementation to start measuring metrics for real API interaction."""
+    async def start_ttfb_custom_metrics(self):
+        """Start measuring time to first byte metrics when speech is detected."""
         async with self._lock:
             self._ttfb_start_time = time.time()
+            self._ttfb_reported = False
+            logger.debug(f"{self.name}: Started TTFB metrics tracking at {self._ttfb_start_time}")
+
+    async def start_processing_custom_metrics(self):
+        """Start measuring processing time metrics when speech stops."""
+        async with self._lock:
             self._processing_start_time = time.time()
-            self._ttfb_reported = False
-            self._metrics_started = True
-            logger.debug(f"{self.name}: Started custom metrics tracking at {self._ttfb_start_time}")
+            logger.debug(f"{self.name}: Started processing metrics tracking at {self._processing_start_time}")
 
-    async def custom_stop_all_metrics(self):
-        """Stop all custom metrics tracking."""
+    async def emit_ttfb_custom_metrics(self):
+        """Emit TTFB metrics when first partial transcript is received."""
         async with self._lock:
-            self._metrics_started = False
-            self._ttfb_start_time = 0
-            self._processing_start_time = 0
-            self._ttfb_reported = False
-            logger.debug(f"{self.name}: Stopped all custom metrics tracking")
-
-    async def emit_ttfb_metrics(self):
-        """Emit TTFB metrics using the custom tracking."""
-        async with self._lock:
-            if not self._metrics_started or self._ttfb_start_time == 0 or self._ttfb_reported:
+            if self._ttfb_start_time == 0 or self._ttfb_reported:
                 return
             
             elapsed = time.time() - self._ttfb_start_time
@@ -131,10 +125,10 @@ class AssemblyAISTTService(STTService):
             
             self._ttfb_reported = True
 
-    async def emit_processing_metrics(self):
-        """Emit processing metrics using the custom tracking."""
+    async def emit_processing_custom_metrics(self):
+        """Emit processing metrics when final transcript is received."""
         async with self._lock:
-            if not self._metrics_started or self._processing_start_time == 0:
+            if self._processing_start_time == 0:
                 return
             
             elapsed = time.time() - self._processing_start_time
@@ -144,11 +138,9 @@ class AssemblyAISTTService(STTService):
             processing = ProcessingMetricsData(processor=self.name, value=elapsed)
             await self.push_frame(MetricsFrame(data=[processing]))
             
-            # Reset metrics state after final processing
-            self._metrics_started = False
+            # Reset processing metrics state after final processing
             self._processing_start_time = 0
-            self._ttfb_start_time = 0
-            
+
     async def _process_result_queue(self):
         """Process transcription results from the websocket thread."""
         while True:
@@ -169,9 +161,9 @@ class AssemblyAISTTService(STTService):
                         )
                         await self.push_frame(frame)
                         
-                        # If we have active metrics and haven't reported TTFB yet, do so now
-                        if self._active_speech and self._metrics_started and not self._ttfb_reported:
-                            await self.emit_ttfb_metrics()
+                        # If we have active speech and haven't reported TTFB yet, do so now
+                        if self._active_speech and not self._ttfb_reported:
+                            await self.emit_ttfb_custom_metrics()
                             
                 elif msg_type == 'Final':
                     text = result.get('text', '')
@@ -183,14 +175,13 @@ class AssemblyAISTTService(STTService):
                         await self.push_frame(frame)
                         
                         # Emit processing metrics for final transcript
-                        if self._active_speech and self._metrics_started:
-                            await self.emit_processing_metrics()
+                        if self._active_speech:
+                            await self.emit_processing_custom_metrics()
                             self._active_speech = False
                             
                 elif msg_type == 'Error':
                     error_message = result.get('error', 'Unknown error from AssemblyAI')
                     logger.error(f"{self}: An error occurred: {error_message}")
-                    await self.custom_stop_all_metrics()
                     await self.push_frame(ErrorFrame(error_message))
                     
             except asyncio.CancelledError:
@@ -369,7 +360,6 @@ class AssemblyAISTTService(STTService):
         self._connected = False
         self._ws_app = None
         self._ws_thread = None
-        await self.custom_stop_all_metrics()
         self._active_speech = False
         
         # Clear audio buffer
@@ -385,28 +375,21 @@ class AssemblyAISTTService(STTService):
         await super().process_frame(frame, direction)
         
         if isinstance(frame, UserStartedSpeakingFrame):
-            # Start custom metrics when speech is detected
-            logger.debug(f"{self.name}: Speech detected, starting metrics")
+            # Start TTFB metrics when speech is detected
+            logger.debug(f"{self.name}: Speech detected, starting TTFB metrics")
             self._active_speech = True
-            await self.custom_start_metrics()
+            await self.start_ttfb_custom_metrics()
             
-            # We still call the standard metrics methods for compatibility
+            # We don't need the standard metrics calls anymore
             #await self.start_ttfb_metrics()
             #await self.start_processing_metrics()
         elif isinstance(frame, UserStoppedSpeakingFrame):
-            # If user stopped speaking, we should start processing metrics
-            # This is when we expect the service to process the complete utterance
+            # Start processing metrics when speech stops
             logger.debug(f"{self.name}: Speech stopped, starting processing metrics")
             
             # We don't need the standard metrics call anymore
             #await self.stop_all_metrics()
             
-            if self._active_speech and self._metrics_started:
-                # Reset the processing start time to measure from when speech stopped
-                self._processing_start_time = time.time()
-                logger.debug(f"{self.name}: Reset processing start time to {self._processing_start_time}")
-            elif not self._active_speech or not self._metrics_started:
-                # If for some reason we didn't start metrics when speech began,
-                # start them now
-                self._active_speech = True
-                await self.custom_start_metrics()
+            if self._active_speech:
+                # Start processing metrics from when speech stopped
+                await self.start_processing_custom_metrics()
