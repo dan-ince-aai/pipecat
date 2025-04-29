@@ -105,7 +105,7 @@ class AssemblyAISTTService(STTService):
             logger.debug(f"{self.name}: Started TTFB metrics tracking at {self._ttfb_start_time}")
 
     async def start_processing_custom_metrics(self):
-        """Start measuring processing time metrics when speech stops."""
+        """Start measuring processing time metrics from the last partial transcript."""
         async with self._lock:
             self._processing_start_time = time.time()
             logger.debug(f"{self.name}: Started processing metrics tracking at {self._processing_start_time}")
@@ -161,9 +161,13 @@ class AssemblyAISTTService(STTService):
                         )
                         await self.push_frame(frame)
                         
-                        # If we have active speech and haven't reported TTFB yet, do so now
-                        if self._active_speech and not self._ttfb_reported:
+                        # For interim transcripts, emit TTFB metrics if not already reported
+                        if not self._ttfb_reported:
                             await self.emit_ttfb_custom_metrics()
+                        
+                        # Start/restart processing metrics from this partial
+                        # This way we measure processing time from the last partial to the final
+                        await self.start_processing_custom_metrics()
                             
                 elif msg_type == 'Final':
                     text = result.get('text', '')
@@ -383,13 +387,8 @@ class AssemblyAISTTService(STTService):
             #await self.start_ttfb_metrics()
             #await self.start_processing_metrics()
         elif isinstance(frame, UserStoppedSpeakingFrame):
-            # Start processing metrics when speech stops
-            logger.debug(f"{self.name}: Speech stopped, starting processing metrics")
+            # No need to start processing metrics here anymore since we're measuring from last partial
+            logger.debug(f"{self.name}: Speech stopped")
             
             # We don't need the standard metrics call anymore
             #await self.stop_all_metrics()
-            
-            if self._active_speech:
-                # Start processing metrics from when speech stopped
-                await self.start_processing_custom_metrics()
-                self._active_speech = False

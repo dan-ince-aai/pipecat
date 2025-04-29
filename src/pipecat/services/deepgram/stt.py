@@ -122,7 +122,7 @@ class DeepgramSTTService(STTService):
         logger.debug(f"{self.name}: Started TTFB metrics tracking at {self._ttfb_start_time}")
 
     async def start_processing_custom_metrics(self):
-        """Start measuring processing time metrics when speech stops."""
+        """Start measuring processing time metrics from the last partial transcript."""
         self._processing_start_time = time.time()
         logger.debug(f"{self.name}: Started processing metrics tracking at {self._processing_start_time}")
 
@@ -230,8 +230,7 @@ class DeepgramSTTService(STTService):
 
     async def _on_utterance_end(self, *args, **kwargs):
         logger.debug(f"{self.name}: Speech stopped (utterance end), starting processing metrics")
-        if self._active_speech:
-            await self.start_processing_custom_metrics()
+        await self.start_processing_custom_metrics()
         await self._call_event_handler("on_utterance_end", *args, **kwargs)
 
     async def _on_message(self, *args, **kwargs):
@@ -255,8 +254,12 @@ class DeepgramSTTService(STTService):
                 self._active_speech = False
             else:
                 # For interim transcripts, emit TTFB metrics if not already reported
-                if not self._ttfb_reported and self._active_speech:
+                if not self._ttfb_reported:
                     await self.emit_ttfb_custom_metrics()
+                
+                # Start/restart processing metrics from this partial
+                # This way we measure processing time from the last partial to the final
+                await self.start_processing_custom_metrics()
                 
                 await self.push_frame(
                     InterimTranscriptionFrame(transcript, "", time_now_iso8601(), language)
@@ -271,12 +274,9 @@ class DeepgramSTTService(STTService):
             self._active_speech = True
             await self.start_ttfb_custom_metrics()
         elif isinstance(frame, UserStoppedSpeakingFrame):
-            # Start processing metrics when speech stops
-            logger.debug(f"{self.name}: Speech stopped (pipeline VAD), starting processing metrics")
-            if self._active_speech:
-                await self.start_processing_custom_metrics()
-                self._active_speech = False
-                
+            # No need to start processing metrics here anymore since we're measuring from last partial
+            logger.debug(f"{self.name}: Speech stopped (pipeline VAD)")
+            
             # https://developers.deepgram.com/docs/finalize
             await self._connection.finalize()
             logger.trace(f"Triggered finalize event on: {frame.name=}, {direction=}")
