@@ -153,20 +153,20 @@ class AssemblyAISTTService(STTService):
                 msg_type = result.get('type')
                 timestamp = time_now_iso8601()
                 
-                if msg_type == 'Partial':
-                    text = result.get('text', '')
-                    if text:
-                        # For interim transcripts, create an InterimTranscriptionFrame
-                        frame = InterimTranscriptionFrame(
-                            text, "", timestamp, self._settings["language"]
-                        )
-                        await self.push_frame(frame)
+                # if msg_type == 'Partial':
+                #     text = result.get('text', '')
+                #     if text:
+                #         # For interim transcripts, create an InterimTranscriptionFrame
+                #         frame = InterimTranscriptionFrame(
+                #             text, "", timestamp, self._settings["language"]
+                #         )
+                #         await self.push_frame(frame)
                         
-                        # For interim transcripts, emit TTFB metrics if not already reported
-                        if not self._ttfb_reported:
-                            await self.emit_ttfb_custom_metrics()
+                #         # For interim transcripts, emit TTFB metrics if not already reported
+                #         if not self._ttfb_reported:
+                #             await self.emit_ttfb_custom_metrics()
                             
-                elif msg_type == 'Final':
+                if msg_type == 'Partial':
                     text = result.get('text', '')
                     if text:
                         # For final transcripts, create a TranscriptionFrame and emit processing metrics
