@@ -16,11 +16,11 @@ from pipecat.frames.frames import (
     MetricsFrame,
     StartFrame,
     TranscriptionFrame,
-    TTFBMetricsData,
-    ProcessingMetricsData,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
+
+from pipecat.metrics.metrics import ProcessingMetricsData, TTFBMetricsData
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
