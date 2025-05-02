@@ -51,6 +51,7 @@ class AssemblyAISTTService(STTService):
         self._api_key = api_key
         self._use_direct_websocket = use_direct_websocket
         self._api_endpoint_base_url = api_endpoint_base_url
+        self._prior_partial = ''
         
         # WebSocket related variables
         self._ws_app = None
@@ -77,6 +78,9 @@ class AssemblyAISTTService(STTService):
         # Queue for handling transcription results from websocket thread
         self._result_queue = asyncio.Queue()
         self._connected = False
+        
+        # Track the last partial transcript for incremental finalization
+        self._last_partial = ''
 
     def can_generate_metrics(self) -> bool:
         """Indicate that this service supports metrics generation."""
@@ -153,30 +157,44 @@ class AssemblyAISTTService(STTService):
                 msg_type = result.get('type')
                 timestamp = time_now_iso8601()
                 
-                # if msg_type == 'Partial':
-                #     text = result.get('text', '')
-                #     if text:
-                #         # For interim transcripts, create an InterimTranscriptionFrame
-                #         frame = InterimTranscriptionFrame(
-                #             text, "", timestamp, self._settings["language"]
-                #         )
-                #         await self.push_frame(frame)
-                        
-                #         # For interim transcripts, emit TTFB metrics if not already reported
-                #         if not self._ttfb_reported:
-                #             await self.emit_ttfb_custom_metrics()
-                            
                 if msg_type == 'Partial':
                     text = result.get('text', '')
+                    
                     if text:
-                        # For final transcripts, create a TranscriptionFrame and emit processing metrics
-                        frame = TranscriptionFrame(
-                            text, "", timestamp, self._settings["language"]
-                        )
-                        await self.push_frame(frame)
+                        # For interim transcripts, emit TTFB metrics if not already reported
+                        if not self._ttfb_reported:
+                            await self.emit_ttfb_custom_metrics()
                         
-                        # Emit processing metrics for final transcript
-                        await self.emit_processing_custom_metrics()
+                        # If we receive a partial that has new words, finalize it
+                        if text != self._last_partial:
+                            full_response = text
+                            common_tokens = 0
+                            
+                            # Find common prefix between current and previous partial
+                            for i in range(min(len(self._last_partial), len(full_response))):
+                                if self._last_partial[i] == full_response[i]:
+                                    common_tokens += 1
+                            
+                            # Extract only the new part of the text
+                            new_text = full_response[common_tokens:]
+                            
+                            # Create a final transcript with only the new text
+                            if new_text:
+                                frame = TranscriptionFrame(
+                                    new_text, "", timestamp, self._settings["language"]
+                                )
+                                await self.push_frame(frame)
+                                
+                                # Emit processing metrics for final transcript
+                                await self.emit_processing_custom_metrics()
+                            
+                            # Update the last partial
+                            self._last_partial = full_response
+                    
+                    # If we receive an empty partial and have accumulated words, we have the end of an utterance
+                    elif len(self._last_partial) > 0:
+                        # Reset the last partial
+                        self._last_partial = ''
                         self._active_speech = False
                             
                 elif msg_type == 'Error':
