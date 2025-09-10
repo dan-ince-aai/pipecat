@@ -112,7 +112,7 @@ class AssemblyAIConnectionParams(BaseModel):
 
     sample_rate: int = 16000
     encoding: Literal["pcm_s16le", "pcm_mulaw"] = "pcm_s16le"
-    format_turns: bool = True
+    formatted_finals: bool = True
     end_of_turn_confidence_threshold: Optional[float] = None
     min_end_of_turn_silence_when_confident: Optional[int] = None
     max_turn_silence: Optional[int] = None
