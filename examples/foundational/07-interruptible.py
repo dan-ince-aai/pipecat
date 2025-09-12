@@ -24,6 +24,18 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.services.llm_service import FunctionCallParams
+from pipecat.processors.frame_processor import FrameDirection
+from pipecat.frames.frames import (
+    Frame,
+    EndFrame,
+    EndTaskFrame,
+    LLMRunFrame,
+    TTSSpeakFrame,
+)
+
 load_dotenv(override=True)
 
 # We store functions so objects (e.g. SileroVADAnalyzer) don't get
@@ -58,16 +70,34 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
     )
 
+    # Function to terminate call
+    terminate_function = FunctionSchema(
+        name="terminate_call",
+        description="Terminate the call when the password reset process is complete and user indicates they are finished",
+        properties={},
+        required=[],
+    )
+
+    async def terminate_call(params: FunctionCallParams) -> None:
+        logger.info("Bot conversation complete. Terminating call.")
+
+        # await params.llm.queue_frame(TTSSpeakFrame("Goodbye."))
+        await params.llm.queue_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+
+
     llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+    llm.register_function("terminate_call", terminate_call)
+
 
     messages = [
         {
             "role": "system",
-            "content": "You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be converted to audio so don't include special characters in your answers. Respond to what the user said in a creative and helpful way.",
+            "content": "You are a helpful LLM in a WebRTC call. Your goal is to demonstrate your capabilities in a succinct way. Your output will be converted to audio so don't include special characters in your answers. Respond to what the user said in a creative and helpful way. Tell a joke then call the terminate_call function.",
         },
     ]
 
-    context = OpenAILLMContext(messages)
+    tools = ToolsSchema(standard_tools=[terminate_function])
+    context = OpenAILLMContext(messages, tools)
     context_aggregator = llm.create_context_aggregator(context)
 
     pipeline = Pipeline(
@@ -100,7 +130,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
-        logger.info(f"Client disconnected")
+        # this fires for smallwebrtc but not for daily transport when terminate_function has been called
+        logger.info(f"Client disconnected !!!!!!")
         await task.cancel()
 
     runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
