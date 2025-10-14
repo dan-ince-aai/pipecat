@@ -626,6 +626,8 @@ class WebsocketTTSService(TTSService, WebsocketService):
         """
         TTSService.__init__(self, **kwargs)
         WebsocketService.__init__(self, reconnect_on_error=reconnect_on_error, **kwargs)
+        self._register_event_handler("on_connected")
+        self._register_event_handler("on_disconnected")
         self._register_event_handler("on_connection_error")
 
     async def _report_error(self, error: ErrorFrame):
@@ -698,6 +700,8 @@ class WebsocketWordTTSService(WordTTSService, WebsocketService):
         """
         WordTTSService.__init__(self, **kwargs)
         WebsocketService.__init__(self, reconnect_on_error=reconnect_on_error, **kwargs)
+        self._register_event_handler("on_connected")
+        self._register_event_handler("on_disconnected")
         self._register_event_handler("on_connection_error")
 
     async def _report_error(self, error: ErrorFrame):

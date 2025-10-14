@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added `on_connected` and `on_disconnected` events to TTS and STT
+  websocket-based services.
+
 - The runner `--folder` argument now supports downloading files from
   subdirectories.
 

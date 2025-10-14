@@ -242,6 +242,7 @@ class CartesiaSTTService(STTService):
             if self._receiver_task is None or self._receiver_task.done():
                 self._receiver_task = asyncio.create_task(self._receive_messages())
             logger.debug(f"Connected to Cartesia")
+            await self._call_event_handler("on_connected")
         except Exception as e:
             logger.error(f"{self}: unable to connect to Cartesia: {e}")
 
