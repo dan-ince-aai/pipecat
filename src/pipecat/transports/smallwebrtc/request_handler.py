@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from aiortc.sdp import candidate_from_sdp
 from fastapi import HTTPException
 from loguru import logger
 
@@ -37,6 +38,23 @@ class SmallWebRTCRequest:
     pc_id: Optional[str] = None
     restart_pc: Optional[bool] = None
     request_data: Optional[Any] = None
+
+
+@dataclass
+class SmallWebRTCPatchRequest:
+    """Small WebRTC transport session arguments for the runner.
+
+    Parameters:
+        pc_id: Identifier for the peer connection.
+        candidate: The ice candidate patch SDP string (Session Description Protocol).
+        sdp_mid: The SDP mid for the candidate patch.
+        sdp_mline_index: The SDP mline index for the candidate patch.
+    """
+
+    pc_id: str
+    candidate: str
+    sdp_mid: str
+    sdp_mline_index: int
 
 
 class ConnectionMode(Enum):
@@ -196,6 +214,19 @@ class SmallWebRTCRequestHandler:
             logger.error(f"Error processing SmallWebRTC request: {e}")
             logger.debug(f"SmallWebRTC request details: {request}")
             raise
+
+    async def handle_patch_request(self, request: SmallWebRTCPatchRequest):
+        """Handle a SmallWebRTC patch candidate request."""
+        peer_connection = self._pcs_map.get(request.pc_id)
+
+        if not peer_connection:
+            raise HTTPException(status_code=404, detail="Peer connection not found")
+
+        candidate = candidate_from_sdp(request.candidate)
+        candidate.sdpMid = request.sdp_mid
+        candidate.sdpMLineIndex = request.sdp_mline_index
+
+        await peer_connection.add_ice_candidate(candidate)
 
     async def close(self):
         """Clear the connection map."""
